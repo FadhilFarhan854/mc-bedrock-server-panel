@@ -49,6 +49,16 @@ export function calculateUptime(startedAt: string): string {
 }
 
 /**
+ * Thrown when exec is attempted on a stopped/paused container (Docker HTTP 409).
+ */
+export class ContainerNotRunningError extends Error {
+  constructor() {
+    super('Container is not running');
+    this.name = 'ContainerNotRunningError';
+  }
+}
+
+/**
  * Run a command inside a container and return stdout as a string.
  * Uses Tty:true to avoid Docker's multiplexed 8-byte frame headers.
  * @param timeoutMs - safety timeout in ms (default 5 s; use larger value for long-running ops)
@@ -58,12 +68,22 @@ export async function execCommand(
   cmd: string[],
   timeoutMs = 5_000,
 ): Promise<string> {
-  const exec = await container.exec({
-    Cmd: cmd,
-    AttachStdout: true,
-    AttachStderr: true,
-    Tty: true,
-  });
+  let exec: Docker.Exec;
+  try {
+    exec = await container.exec({
+      Cmd: cmd,
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: true,
+    });
+  } catch (err) {
+    // Docker returns 409 when container is stopped/paused
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes('409') || msg.toLowerCase().includes('not running')) {
+      throw new ContainerNotRunningError();
+    }
+    throw err;
+  }
 
   const stream = await exec.start({ hijack: true, stdin: false });
 

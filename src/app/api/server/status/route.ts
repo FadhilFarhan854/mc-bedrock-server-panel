@@ -5,6 +5,7 @@ import {
   parseEnvVars,
   calculateUptime,
   parseMcMonitorPlayers,
+  ContainerNotRunningError,
 } from '@/lib/docker';
 import type { ServerInfo } from '@/types';
 
@@ -77,6 +78,15 @@ export async function GET() {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : 'Failed to connect to Docker';
+
+    // Container exists but stopped mid-request (race condition) — return stopped status
+    if (error instanceof ContainerNotRunningError) {
+      return NextResponse.json(
+        { error: message, containerName: process.env.CONTAINER_NAME ?? 'bds', status: 'exited' },
+        { status: 200 }
+      );
+    }
+
     return NextResponse.json(
       { error: message, containerName: process.env.CONTAINER_NAME ?? 'bds' },
       { status: 500 }
