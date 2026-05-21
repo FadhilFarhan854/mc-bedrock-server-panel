@@ -32,9 +32,14 @@ const SCHEMA: PropDef[] = [
   { key: 'tick-distance',      label: 'Tick Distance',        type: 'number',  group: 'Performance' },
   { key: 'player-idle-timeout',label: 'Idle Timeout (min)',   type: 'number',  group: 'Performance' },
   { key: 'max-threads',        label: 'Max Threads',          type: 'number',  group: 'Performance' },
+  // Gameplay
+  { key: 'show-coordinates',           label: 'Show Coordinates in HUD',                   type: 'boolean', group: 'Gameplay' },
+  { key: 'keep-inventory',             label: 'Keep Inventory on Death',                   type: 'boolean', group: 'Gameplay' },
+  { key: 'disable-custom-skins',       label: 'Only Allow Trusted Skins (Marketplace)',    type: 'boolean', group: 'Gameplay' },
+  { key: 'players-sleeping-percentage',label: 'Sleeping % to Skip Night (default: 100)',   type: 'number',  group: 'Gameplay' },
 ];
 
-const GROUPS = ['Server', 'Network', 'Performance'];
+const GROUPS = ['Server', 'Network', 'Performance', 'Gameplay'];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function fieldClass(base: string) {
