@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
 import { randomBytes } from 'crypto';
-import { pack as tarPack } from 'tar-stream';
 import { getContainer, execCommand } from '@/lib/docker';
 
 // Increase body size limit for file uploads (up to 512 MB)
@@ -92,20 +91,50 @@ export async function POST(request: Request) {
     // ── 1. Create the upload directory ─────────────────────────
     await execCommand(container, ['bash', '-c', `mkdir -p '${uploadDir}'`], 10_000);
 
-    // ── 2. Upload zip into uploadDir via putArchive ─────────────
-    // Start putArchive FIRST so it drains the pack stream while we write,
-    // preventing backpressure deadlock for large files.
-    const pack     = tarPack();
-    const tarEntry = pack.entry({ name: tmpName, size: fileBuffer.byteLength });
-    const putPromise = new Promise<void>((resolve, reject) => {
-      container.putArchive(pack, { path: uploadDir }, (err: unknown) => {
-        if (err) reject(err instanceof Error ? err : new Error(String(err)));
-        else resolve();
-      });
+    // ── 2. Write file directly into container via exec stdin ────
+    // putArchive wraps the payload in a tar archive, which can introduce
+    // binary corruption on certain byte patterns. Writing via exec stdin
+    // (`cat > file`) sends raw bytes over the hijacked Docker socket with
+    // zero encoding: whatever we write is exactly what lands on disk.
+    const writeExec = await container.exec({
+      Cmd:           ['bash', '-c', `cat > '${uploadDir}/${tmpName}'`],
+      AttachStdin:   true,
+      AttachStdout:  true,
+      AttachStderr:  true,
+      Tty:           false,
     });
-    tarEntry.end(fileBuffer);
-    pack.finalize();
-    await putPromise;
+    const writeStream = await writeExec.start({ hijack: true, stdin: true });
+
+    // Drain demuxed stdout/stderr frames from the container process
+    // (cat produces no output; flowing mode discards whatever Docker sends)
+    writeStream.resume();
+
+    // Pump fileBuffer → stdin in 64 KB chunks, respecting backpressure
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(
+        () => reject(new Error('File write to container timed out')),
+        120_000,
+      );
+      const done = (e?: Error) => { clearTimeout(timeout); e ? reject(e) : resolve(); };
+      writeStream.once('end',   () => done());
+      writeStream.once('close', () => done());
+      writeStream.once('error', (e: Error) => done(e));
+
+      const CHUNK = 64 * 1024;
+      let offset = 0;
+      const pump = () => {
+        while (offset < fileBuffer.length) {
+          const slice = fileBuffer.subarray(offset, offset + CHUNK);
+          offset += slice.length;
+          if (!writeStream.write(slice) && offset < fileBuffer.length) {
+            writeStream.once('drain', pump);
+            return;
+          }
+        }
+        writeStream.end(); // EOF → cat exits → Docker closes socket → 'end'
+      };
+      pump();
+    });
 
     // ── 3. Unzip in place & clean up ───────────────────────────
     let destDir: string;
