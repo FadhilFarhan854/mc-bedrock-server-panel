@@ -45,19 +45,21 @@ export async function GET() {
   }
 }
 
-// ── POST — upload file ───────────────────────────────────────────
+// ── POST — upload file (raw binary body, metadata via URL params) ──
 export async function POST(request: Request) {
   try {
-    const formData = await request.formData();
-    const file      = formData.get('file')      as File | null;
-    const type      = formData.get('type')      as string | null; // 'world' | 'resource' | 'behavior'
-    const worldName = (formData.get('worldName') as string | null)?.trim();
+    const url       = new URL(request.url);
+    const type      = url.searchParams.get('type') ?? 'world';        // 'world' | 'resource' | 'behavior'
+    const worldName = (url.searchParams.get('worldName') ?? '').trim();
+    const rawFilename = request.headers.get('x-filename');
 
-    if (!file) {
-      return NextResponse.json({ error: 'No file provided' }, { status: 400 });
+    if (!rawFilename) {
+      return NextResponse.json({ error: 'Missing X-Filename header' }, { status: 400 });
     }
 
-    const ext = getExt(file.name);
+    const filename = decodeURIComponent(rawFilename);
+    const ext      = getExt(filename);
+
     if (!ALLOWED_EXTS.has(ext)) {
       return NextResponse.json(
         { error: `File type ".${ext}" not allowed. Use .mcworld, .mcpack, .mcaddon, .mctemplate, or .zip` },
@@ -66,12 +68,15 @@ export async function POST(request: Request) {
     }
 
     // Sanitize filename: strip path separators
-    const safeFilename = file.name.replace(/[/\\]/g, '_');
+    const safeFilename = filename.replace(/[/\\]/g, '_');
 
-    // Convert to Buffer and create tar archive
-    const arrayBuffer = await file.arrayBuffer();
-    const fileBuffer  = Buffer.from(arrayBuffer);
-    const tarBuffer   = createTarBuffer(safeFilename, fileBuffer);
+    // Read raw binary body
+    const arrayBuffer = await request.arrayBuffer();
+    if (arrayBuffer.byteLength === 0) {
+      return NextResponse.json({ error: 'Empty file' }, { status: 400 });
+    }
+    const fileBuffer = Buffer.from(arrayBuffer);
+    const tarBuffer  = createTarBuffer(safeFilename, fileBuffer);
 
     const container = getContainer();
 

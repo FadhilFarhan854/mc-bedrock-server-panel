@@ -132,14 +132,20 @@ export default function WorldsPage() {
     }));
 
     try {
-      const fd = new FormData();
-      fd.append('file', state.file);
-      fd.append('type', type);
+      // Build URL params (avoid FormData — Next.js App Router has parsing issues with multipart)
+      const params = new URLSearchParams({ type });
       if (type === 'world' && state.worldName) {
-        fd.append('worldName', state.worldName);
+        params.set('worldName', state.worldName);
       }
 
-      const res = await fetch('/api/server/worlds', { method: 'POST', body: fd });
+      const res = await fetch(`/api/server/worlds?${params.toString()}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Filename': encodeURIComponent(state.file.name),
+        },
+        body: state.file,   // send raw binary — no FormData parsing needed
+      });
       const json = (await res.json()) as { success?: boolean; error?: string; destination?: string };
 
       if (!res.ok || !json.success) {

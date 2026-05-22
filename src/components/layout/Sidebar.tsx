@@ -4,13 +4,14 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import {
   LayoutDashboard, Terminal, Settings, LogOut,
-  Server, Shield, HardDrive, Tag, Globe, X,
+  Server, Shield, HardDrive, Tag, Globe, Gamepad2, X,
 } from 'lucide-react';
 
 const NAV_ITEMS = [
   { href: '/',           label: 'Dashboard', icon: LayoutDashboard },
   { href: '/console',    label: 'Console',   icon: Terminal         },
   { href: '/properties', label: 'Properties',icon: Settings         },
+  { href: '/gamerules',  label: 'Gamerules', icon: Gamepad2         },
   { href: '/allowlist',  label: 'Allow List',icon: Shield           },
   { href: '/backups',    label: 'Backups',   icon: HardDrive        },
   { href: '/version',    label: 'Version',   icon: Tag              },
