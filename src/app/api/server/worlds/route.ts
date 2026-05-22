@@ -90,17 +90,34 @@ export async function POST(request: Request) {
     }
 
     const arrayBuffer = await request.arrayBuffer();
-    if (arrayBuffer.byteLength === 0) {
-      return NextResponse.json({ error: 'Empty file' }, { status: 400 });
+    const fileBuffer  = Buffer.from(arrayBuffer);
+
+    if (fileBuffer.byteLength === 0) {
+      return NextResponse.json({ error: 'Empty file (0 bytes received)' }, { status: 400 });
+    }
+
+    // First 4 bytes of a valid ZIP must be PK\x03\x04 (hex: 504b0304)
+    const magic = fileBuffer.subarray(0, 4).toString('hex');
+    if (magic !== '504b0304') {
+      return NextResponse.json(
+        {
+          error: `File is not a valid ZIP archive`,
+          detail: `Received ${fileBuffer.byteLength} bytes, first 4 bytes: ${magic} (expected 504b0304)`,
+        },
+        { status: 400 },
+      );
     }
 
     // ── Unzip entirely in Node.js — no shell commands needed ─────
     let zip: Awaited<ReturnType<typeof JSZip.loadAsync>>;
     try {
-      zip = await JSZip.loadAsync(arrayBuffer);
+      zip = await JSZip.loadAsync(fileBuffer as unknown as ArrayBuffer);
     } catch (e) {
       return NextResponse.json(
-        { error: `Cannot unzip file: ${e instanceof Error ? e.message : String(e)}` },
+        {
+          error: `Cannot unzip file: ${e instanceof Error ? e.message : String(e)}`,
+          detail: `Received ${fileBuffer.byteLength} bytes, magic: ${magic}`,
+        },
         { status: 400 },
       );
     }
