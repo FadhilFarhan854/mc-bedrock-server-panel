@@ -67,8 +67,8 @@ export async function POST(request: Request) {
       );
     }
 
-    // Sanitize filename: strip path separators
-    const safeFilename = filename.replace(/[/\\]/g, '_');
+    // Use a safe, predictable temp filename — avoids all shell/tar issues with special chars
+    const safeFilename = `mc_upload_${Date.now()}.${ext}`;
 
     // Read raw binary body
     const arrayBuffer = await request.arrayBuffer();
@@ -100,6 +100,8 @@ export async function POST(request: Request) {
         container,
         [
           'bash', '-c',
+          // 0. Verify file exists in /tmp
+          `if [ ! -f "${tempPath}" ]; then echo "FILE_MISSING"; ls /tmp/ 2>&1; exit 1; fi; ` +
           // 1. Clean up any stale temp dir
           `rm -rf /tmp/mc_world_extract; ` +
           `mkdir -p /tmp/mc_world_extract; ` +
@@ -121,11 +123,13 @@ export async function POST(request: Request) {
       );
 
       if (!output.includes('__done__')) {
-        const detail = output.includes('UNZIP_FAILED')
-          ? `unzip error (${output.match(/UNZIP_FAILED:(\d+)/)?.[1] ?? '?'}) — file may be corrupted`
+        const detail = output.includes('FILE_MISSING')
+          ? `file not found in container after upload. /tmp: ${output.replace('FILE_MISSING', '').trim().slice(0, 200)}`
+          : output.includes('UNZIP_FAILED')
+          ? `unzip error (${output.match(/UNZIP_FAILED:(\d+)/)?.[1] ?? '?'})`
           : output.includes('NO_LEVEL_DAT')
           ? 'level.dat not found — this may not be a valid .mcworld file'
-          : output.trim().slice(-300) || 'no output from container';
+          : output.trim().slice(-400) || 'no output from container';
         return NextResponse.json({ error: `World extraction failed: ${detail}` }, { status: 500 });
       }
 
@@ -142,6 +146,7 @@ export async function POST(request: Request) {
       container,
       [
         'bash', '-c',
+        `if [ ! -f "${tempPath}" ]; then echo "FILE_MISSING"; ls /tmp/ 2>&1; exit 1; fi; ` +
         `rm -rf /tmp/mc_pack_extract; ` +
         `mkdir -p /tmp/mc_pack_extract; ` +
         // unzip exit code 1 = warning (still OK)
