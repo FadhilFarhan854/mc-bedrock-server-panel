@@ -1,7 +1,13 @@
 import { NextResponse } from 'next/server';
 import { getContainer, execCommand } from '@/lib/docker';
 import { createMultiFileTarBuffer } from '@/lib/tar';
-import { unzipSync } from 'fflate';
+
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const JSZip = require('jszip') as {
+  loadAsync(data: ArrayBuffer): Promise<{
+    files: Record<string, { dir: boolean; async(type: 'nodebuffer'): Promise<Buffer> }>;
+  }>;
+};
 
 // Increase body size limit for file uploads (up to 200 MB)
 export const maxDuration = 120;
@@ -89,15 +95,25 @@ export async function POST(request: Request) {
     }
 
     // ── Unzip entirely in Node.js — no shell commands needed ─────
-    let unzipped: ReturnType<typeof unzipSync>;
+    let zip: Awaited<ReturnType<typeof JSZip.loadAsync>>;
     try {
-      unzipped = unzipSync(new Uint8Array(arrayBuffer));
+      zip = await JSZip.loadAsync(arrayBuffer);
     } catch (e) {
       return NextResponse.json(
         { error: `Cannot unzip file: ${e instanceof Error ? e.message : String(e)}` },
         { status: 400 },
       );
     }
+
+    // Build flat map: path → Buffer (skip directory entries)
+    const unzipped: Record<string, Buffer> = {};
+    await Promise.all(
+      Object.entries(zip.files).map(async ([p, entry]) => {
+        if (!(entry as { dir: boolean }).dir) {
+          unzipped[p] = await (entry as { async(t: 'nodebuffer'): Promise<Buffer> }).async('nodebuffer');
+        }
+      }),
+    );
 
     const allPaths = Object.keys(unzipped);
     const container = getContainer();
@@ -120,9 +136,8 @@ export async function POST(request: Request) {
       const files: Record<string, Buffer> = {};
       for (const [p, data] of Object.entries(unzipped)) {
         if (prefix && !p.startsWith(prefix)) continue;
-        if (p.endsWith('/')) continue; // skip directory entries
         const rel = p.slice(prefix.length);
-        if (rel) files[rel] = Buffer.from(data);
+        if (rel) files[rel] = data;
       }
 
       const levelName = worldName
@@ -142,7 +157,7 @@ export async function POST(request: Request) {
     let uuid = `pack_${Date.now()}`;
     if (manifestPath) {
       try {
-        const manifest = JSON.parse(Buffer.from(unzipped[manifestPath]).toString('utf8')) as {
+        const manifest = JSON.parse(unzipped[manifestPath].toString('utf8')) as {
           header?: { uuid?: string };
         };
         if (manifest.header?.uuid) uuid = manifest.header.uuid;
@@ -159,9 +174,8 @@ export async function POST(request: Request) {
     const files: Record<string, Buffer> = {};
     for (const [p, data] of Object.entries(unzipped)) {
       if (prefix && !p.startsWith(prefix)) continue;
-      if (p.endsWith('/')) continue;
       const rel = p.slice(prefix.length);
-      if (rel) files[rel] = Buffer.from(data);
+      if (rel) files[rel] = data;
     }
 
     await putFiles(container, files, `/data/${packDir}/${uuid}`);
