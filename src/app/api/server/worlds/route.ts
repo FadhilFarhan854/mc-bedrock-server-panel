@@ -100,19 +100,30 @@ export async function POST(request: Request) {
         container,
         [
           'bash', '-c',
-          `set -e && ` +
-          `mkdir -p /tmp/mc_world_extract && ` +
-          `unzip -o "${tempPath}" -d /tmp/mc_world_extract/ && ` +
-          `mkdir -p "/data/worlds/${levelName}" && ` +
-          `cp -rf /tmp/mc_world_extract/* "/data/worlds/${levelName}/" && ` +
-          `rm -rf /tmp/mc_world_extract "${tempPath}" && ` +
-          `echo "__done__"`,
+          // 1. Clean up any stale temp dir from a previous failed run
+          `rm -rf /tmp/mc_world_extract; ` +
+          `mkdir -p /tmp/mc_world_extract; ` +
+          // 2. Extract the .mcworld (it's just a zip)
+          `unzip -o "${tempPath}" -d /tmp/mc_world_extract/; ` +
+          `if [ $? -ne 0 ]; then echo "UNZIP_FAILED"; exit 1; fi; ` +
+          // 3. Detect structure: flat (level.dat at root) vs nested (level.dat inside a subfolder)
+          `SRCDIR=/tmp/mc_world_extract; ` +
+          `SUBDIR=$(find /tmp/mc_world_extract -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1); ` +
+          `if [ -n "$SUBDIR" ] && [ -f "$SUBDIR/level.dat" ]; then SRCDIR=$SUBDIR; fi; ` +
+          // 4. Copy world files (use /. to include hidden files)
+          `mkdir -p "/data/worlds/${levelName}"; ` +
+          `cp -rf "$SRCDIR/." "/data/worlds/${levelName}/"; ` +
+          `rm -rf /tmp/mc_world_extract "${tempPath}"; ` +
+          `echo __done__`,
         ],
         60_000,
       );
 
       if (!output.includes('__done__')) {
-        return NextResponse.json({ error: 'World extraction failed', detail: output }, { status: 500 });
+        const detail = output.includes('UNZIP_FAILED')
+          ? 'unzip failed — file may be corrupted or not a valid .mcworld'
+          : output.trim() || 'no output from container';
+        return NextResponse.json({ error: 'World extraction failed', detail }, { status: 500 });
       }
 
       return NextResponse.json({ success: true, destination: `/data/worlds/${levelName}` });

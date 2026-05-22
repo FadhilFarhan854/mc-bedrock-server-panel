@@ -26,6 +26,12 @@ interface SectionUploadState {
 // ── Helpers ──────────────────────────────────────────────────────
 const ALLOWED = '.mcworld,.mcpack,.mcaddon,.mctemplate,.zip';
 
+// Packs that ship with the Bedrock Dedicated Server (built-in / default)
+const BUILTIN_PACK_RE = /^(vanilla|editor|chemistry|experimental_)/i;
+function isBuiltinPack(name: string): boolean {
+  return BUILTIN_PACK_RE.test(name);
+}
+
 function freshUpload(): SectionUploadState {
   return { file: null, worldName: '', uploading: false, error: '', success: '' };
 }
@@ -96,6 +102,12 @@ export default function WorldsPage() {
 
   // Deleting item tracking: `${type}:${name}`
   const [deleting, setDeleting] = useState<Set<string>>(new Set());
+
+  // Show built-in packs toggle per section
+  const [showBuiltin, setShowBuiltin] = useState<Record<'resource' | 'behavior', boolean>>({
+    resource: false,
+    behavior: false,
+  });
 
   // File input refs
   const fileRefs = {
@@ -350,27 +362,56 @@ export default function WorldsPage() {
 
           {/* ── Resource Packs ── */}
           <div className="bg-panel-card rounded-xl border border-panel-border p-5">
-            <SectionHeader
-              icon={Package}
-              label="Resource Packs"
-              count={data.resourcePacks.length}
-              accent="bg-green-500/10 text-green-400"
-            />
-
-            {data.resourcePacks.length === 0 ? (
-              <p className="text-xs text-slate-600 py-2">No resource packs in /data/resource_packs</p>
-            ) : (
-              <div className="divide-y divide-panel-border/50">
-                {data.resourcePacks.map((name) => (
-                  <ItemRow
-                    key={name}
-                    name={name}
-                    onDelete={() => handleDelete('resource', name)}
-                    deleting={deleting.has(`resource:${name}`)}
+            {(() => {
+              const userPacks    = data.resourcePacks.filter((n) => !isBuiltinPack(n));
+              const builtinPacks = data.resourcePacks.filter(isBuiltinPack);
+              return (
+                <>
+                  <SectionHeader
+                    icon={Package}
+                    label="Resource Packs"
+                    count={userPacks.length}
+                    accent="bg-green-500/10 text-green-400"
                   />
-                ))}
-              </div>
-            )}
+
+                  {userPacks.length === 0 ? (
+                    <p className="text-xs text-slate-600 py-2">No user-uploaded resource packs</p>
+                  ) : (
+                    <div className="divide-y divide-panel-border/50">
+                      {userPacks.map((name) => (
+                        <ItemRow
+                          key={name}
+                          name={name}
+                          onDelete={() => handleDelete('resource', name)}
+                          deleting={deleting.has(`resource:${name}`)}
+                        />
+                      ))}
+                    </div>
+                  )}
+
+                  {builtinPacks.length > 0 && (
+                    <div className="mt-3">
+                      <button
+                        onClick={() => setShowBuiltin((prev) => ({ ...prev, resource: !prev.resource }))}
+                        className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-400 transition-colors"
+                      >
+                        {showBuiltin.resource ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                        {showBuiltin.resource ? 'Hide' : `Show ${builtinPacks.length} built-in`} packs
+                      </button>
+                      {showBuiltin.resource && (
+                        <div className="divide-y divide-panel-border/50 mt-2 opacity-40">
+                          {builtinPacks.map((name) => (
+                            <div key={name} className="py-2 px-3">
+                              <span className="text-sm text-slate-500 font-mono">{name}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
 
             {renderUploadForm('resource', '.mcpack,.mcaddon,.zip')}
 
@@ -383,27 +424,56 @@ export default function WorldsPage() {
 
           {/* ── Behavior Packs ── */}
           <div className="bg-panel-card rounded-xl border border-panel-border p-5">
-            <SectionHeader
-              icon={Cpu}
-              label="Behavior Packs"
-              count={data.behaviorPacks.length}
-              accent="bg-purple-500/10 text-purple-400"
-            />
-
-            {data.behaviorPacks.length === 0 ? (
-              <p className="text-xs text-slate-600 py-2">No behavior packs in /data/behavior_packs</p>
-            ) : (
-              <div className="divide-y divide-panel-border/50">
-                {data.behaviorPacks.map((name) => (
-                  <ItemRow
-                    key={name}
-                    name={name}
-                    onDelete={() => handleDelete('behavior', name)}
-                    deleting={deleting.has(`behavior:${name}`)}
+            {(() => {
+              const userPacks    = data.behaviorPacks.filter((n) => !isBuiltinPack(n));
+              const builtinPacks = data.behaviorPacks.filter(isBuiltinPack);
+              return (
+                <>
+                  <SectionHeader
+                    icon={Cpu}
+                    label="Behavior Packs"
+                    count={userPacks.length}
+                    accent="bg-purple-500/10 text-purple-400"
                   />
-                ))}
-              </div>
-            )}
+
+                  {userPacks.length === 0 ? (
+                    <p className="text-xs text-slate-600 py-2">No user-uploaded behavior packs</p>
+                  ) : (
+                    <div className="divide-y divide-panel-border/50">
+                      {userPacks.map((name) => (
+                        <ItemRow
+                          key={name}
+                          name={name}
+                          onDelete={() => handleDelete('behavior', name)}
+                          deleting={deleting.has(`behavior:${name}`)}
+                        />
+                      ))}
+                    </div>
+                  )}
+
+                  {builtinPacks.length > 0 && (
+                    <div className="mt-3">
+                      <button
+                        onClick={() => setShowBuiltin((prev) => ({ ...prev, behavior: !prev.behavior }))}
+                        className="flex items-center gap-1.5 text-xs text-slate-600 hover:text-slate-400 transition-colors"
+                      >
+                        {showBuiltin.behavior ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                        {showBuiltin.behavior ? 'Hide' : `Show ${builtinPacks.length} built-in`} packs
+                      </button>
+                      {showBuiltin.behavior && (
+                        <div className="divide-y divide-panel-border/50 mt-2 opacity-40">
+                          {builtinPacks.map((name) => (
+                            <div key={name} className="py-2 px-3">
+                              <span className="text-sm text-slate-500 font-mono">{name}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </>
+              );
+            })()}
 
             {renderUploadForm('behavior', '.mcpack,.mcaddon,.zip')}
 
