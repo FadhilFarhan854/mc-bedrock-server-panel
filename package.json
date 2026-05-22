@@ -18,7 +18,7 @@
   },
   "devDependencies": {
     "@types/dockerode": "^3.3.38",
-    "@types/tar-stream": "^3.1.5",
+    "@types/tar-stream": "^3.1.4",
     "@types/node": "^22.15.18",
     "@types/react": "^19.1.4",
     "@types/react-dom": "^19.1.3",
