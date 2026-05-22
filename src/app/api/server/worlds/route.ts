@@ -75,6 +75,16 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Empty file (0 bytes received)' }, { status: 400 });
     }
 
+    // Validate ZIP magic bytes (PK\x03\x04 = 0x504b0304) before doing anything else.
+    // If this fails, the corruption happened before we even touch the container.
+    const magic = fileBuffer.subarray(0, 4).toString('hex');
+    if (magic !== '504b0304') {
+      return NextResponse.json(
+        { error: `File is not a valid ZIP archive (header bytes: ${magic}, expected 504b0304). Try re-exporting the world from Minecraft.` },
+        { status: 400 },
+      );
+    }
+
     const container  = getContainer();
     const isWorld    = type === 'world' || ext === 'mcworld' || ext === 'mctemplate';
     const levelName  = worldName
@@ -164,6 +174,23 @@ export async function POST(request: Request) {
       }
       destDir = uploadDir;
 
+      // ── 4. Update level-name in server.properties ──────────
+      // Set level-name to the uploaded world's directory name so the
+      // server loads it on next restart. Also neutralize /etc/bds-property-definitions.json
+      // so that bedrock-entry.sh's `set-property --bulk` becomes a no-op
+      // and our saved value persists through container restarts.
+      const updateLevelScript =
+        // Remove any existing level-name line, append the new value
+        `tmpf=$(mktemp); ` +
+        `if [ -f /data/server.properties ]; then ` +
+        `  grep -v '^level-name=' /data/server.properties > "$tmpf"; ` +
+        `else touch "$tmpf"; fi; ` +
+        `echo 'level-name=${levelName}' >> "$tmpf"; ` +
+        `cat "$tmpf" > /data/server.properties; ` +
+        `rm -f "$tmpf"; ` +
+        `echo '{}' > /etc/bds-property-definitions.json`;
+      await execCommand(container, ['bash', '-c', updateLevelScript], 10_000).catch(() => null);
+
     } else {
       const packDir = type === 'behavior' ? 'behavior_packs' : 'resource_packs';
       const script =
@@ -193,7 +220,7 @@ export async function POST(request: Request) {
       destDir = `/data/${packDir}/${uuid}`;
     }
 
-    return NextResponse.json({ success: true, destination: destDir });
+    return NextResponse.json({ success: true, destination: destDir, activatedLevel: isWorld ? levelName : undefined });
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -158,15 +158,19 @@ export default function WorldsPage() {
         },
         body: state.file,   // send raw binary — no FormData parsing needed
       });
-      const json = (await res.json()) as { success?: boolean; error?: string; destination?: string };
+      const json = (await res.json()) as { success?: boolean; error?: string; destination?: string; activatedLevel?: string };
 
       if (!res.ok || !json.success) {
         throw new Error(json.error ?? 'Upload failed');
       }
 
+      const successMsg = json.activatedLevel
+        ? `World uploaded and set as active level ("${json.activatedLevel}"). Restart server to apply.`
+        : `Uploaded → ${json.destination ?? 'container'}`;
+
       setUploads((prev) => ({
         ...prev,
-        [type]: { ...freshUpload(), success: `Uploaded → ${json.destination ?? 'container'}` },
+        [type]: { ...freshUpload(), success: successMsg },
       }));
       if (fileRefs[type].current) fileRefs[type].current!.value = '';
       setShowForm((prev) => ({ ...prev, [type]: false }));

@@ -72,6 +72,18 @@ export async function POST(request: Request) {
       `echo '${b64}' | base64 -d > /data/server.properties`,
     ]);
 
+    // Neutralize the Docker entrypoint's property override mechanism.
+    // bedrock-entry.sh calls `set-property --bulk /etc/bds-property-definitions.json`
+    // on every container start, which re-applies env vars and overwrites server.properties.
+    // Replacing the definitions file with an empty object makes set-property a no-op,
+    // so our saved values persist through restarts. This change lives in the container's
+    // writable layer and survives stop/start (only lost on container removal).
+    await execCommand(container, [
+      'bash',
+      '-c',
+      "echo '{}' > /etc/bds-property-definitions.json",
+    ], 5_000).catch(() => null); // non-fatal — properties are still saved even if this fails
+
     return NextResponse.json({ success: true });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to write properties';
