@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getContainer, execCommand } from '@/lib/docker';
-import { createTarBuffer } from '@/lib/tar';
+import { createMultiFileTarBuffer } from '@/lib/tar';
+import { unzipSync } from 'fflate';
 
 // Increase body size limit for file uploads (up to 200 MB)
 export const maxDuration = 120;
@@ -10,6 +11,21 @@ const ALLOWED_EXTS = new Set(['mcworld', 'mcpack', 'mcaddon', 'mctemplate', 'zip
 
 function getExt(name: string): string {
   return (name.split('.').pop() ?? '').toLowerCase();
+}
+
+/** Upload a set of in-memory files directly into the container via tar. */
+async function putFiles(
+  container: ReturnType<typeof getContainer>,
+  files: Record<string, Buffer>,
+  destPath: string,
+): Promise<void> {
+  const tar = createMultiFileTarBuffer(files);
+  await new Promise<void>((resolve, reject) => {
+    container.putArchive(tar, { path: destPath }, (err: unknown) => {
+      if (err) reject(err instanceof Error ? err : new Error(String(err)));
+      else resolve();
+    });
+  });
 }
 
 // ── GET — list worlds and packs ──────────────────────────────────
@@ -49,7 +65,7 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const url       = new URL(request.url);
-    const type      = url.searchParams.get('type') ?? 'world';        // 'world' | 'resource' | 'behavior'
+    const type      = url.searchParams.get('type') ?? 'world';
     const worldName = (url.searchParams.get('worldName') ?? '').trim();
     const rawFilename = request.headers.get('x-filename');
 
@@ -67,112 +83,90 @@ export async function POST(request: Request) {
       );
     }
 
-    // Use a safe, predictable temp filename — avoids all shell/tar issues with special chars
-    const safeFilename = `mc_upload_${Date.now()}.${ext}`;
-
-    // Read raw binary body
     const arrayBuffer = await request.arrayBuffer();
     if (arrayBuffer.byteLength === 0) {
       return NextResponse.json({ error: 'Empty file' }, { status: 400 });
     }
-    const fileBuffer = Buffer.from(arrayBuffer);
-    const tarBuffer  = createTarBuffer(safeFilename, fileBuffer);
 
+    // ── Unzip entirely in Node.js — no shell commands needed ─────
+    let unzipped: ReturnType<typeof unzipSync>;
+    try {
+      unzipped = unzipSync(new Uint8Array(arrayBuffer));
+    } catch (e) {
+      return NextResponse.json(
+        { error: `Cannot unzip file: ${e instanceof Error ? e.message : String(e)}` },
+        { status: 400 },
+      );
+    }
+
+    const allPaths = Object.keys(unzipped);
     const container = getContainer();
 
-    // Upload file into container's /tmp via Docker Archive API
-    await new Promise<void>((resolve, reject) => {
-      container.putArchive(tarBuffer, { path: '/tmp' }, (err: unknown) => {
-        if (err) reject(err instanceof Error ? err : new Error(String(err)));
-        else resolve();
-      });
-    });
-
-    const tempPath = `/tmp/${safeFilename}`;
-
-    // ── World / template extraction ──
+    // ── World / template ──────────────────────────────────────────
     if (type === 'world' || ext === 'mcworld' || ext === 'mctemplate') {
+      // Find level.dat anywhere in the zip to determine the prefix to strip
+      const levelDatPath = allPaths.find((p) => p === 'level.dat' || p.endsWith('/level.dat'));
+
+      if (!levelDatPath) {
+        return NextResponse.json(
+          { error: 'Invalid world file: level.dat not found inside the archive' },
+          { status: 400 },
+        );
+      }
+
+      // Strip the leading folder (e.g. "MyWorld/level.dat" → prefix = "MyWorld/")
+      const prefix = levelDatPath.slice(0, levelDatPath.length - 'level.dat'.length);
+
+      const files: Record<string, Buffer> = {};
+      for (const [p, data] of Object.entries(unzipped)) {
+        if (prefix && !p.startsWith(prefix)) continue;
+        if (p.endsWith('/')) continue; // skip directory entries
+        const rel = p.slice(prefix.length);
+        if (rel) files[rel] = Buffer.from(data);
+      }
+
       const levelName = worldName
         ? worldName.replace(/[^a-zA-Z0-9 _\-().]/g, '_')
         : 'Uploaded World';
 
-      const output = await execCommand(
-        container,
-        [
-          'bash', '-c',
-          // 0. Verify file exists in /tmp
-          `if [ ! -f "${tempPath}" ]; then echo "FILE_MISSING"; ls /tmp/ 2>&1; exit 1; fi; ` +
-          // 1. Clean up any stale temp dir
-          `rm -rf /tmp/mc_world_extract; ` +
-          `mkdir -p /tmp/mc_world_extract; ` +
-          // 2. Extract — unzip exit code 1 = warning (still OK), >=2 = real error
-          `unzip -o "${tempPath}" -d /tmp/mc_world_extract/ 2>&1; ` +
-          `UNZIP_RC=$?; ` +
-          `if [ $UNZIP_RC -ge 2 ]; then echo "UNZIP_FAILED:$UNZIP_RC"; exit 1; fi; ` +
-          // 3. Find level.dat anywhere inside the extracted tree
-          `LEVEL_DAT=$(find /tmp/mc_world_extract -name "level.dat" 2>/dev/null | head -1); ` +
-          `if [ -z "$LEVEL_DAT" ]; then echo "NO_LEVEL_DAT"; exit 1; fi; ` +
-          `SRCDIR=$(dirname "$LEVEL_DAT"); ` +
-          // 4. Copy world files to destination
-          `mkdir -p "/data/worlds/${levelName}"; ` +
-          `cp -rf "$SRCDIR/." "/data/worlds/${levelName}/"; ` +
-          `rm -rf /tmp/mc_world_extract "${tempPath}"; ` +
-          `echo __done__`,
-        ],
-        60_000,
-      );
-
-      if (!output.includes('__done__')) {
-        const detail = output.includes('FILE_MISSING')
-          ? `file not found in container after upload. /tmp: ${output.replace('FILE_MISSING', '').trim().slice(0, 200)}`
-          : output.includes('UNZIP_FAILED')
-          ? `unzip error (${output.match(/UNZIP_FAILED:(\d+)/)?.[1] ?? '?'})`
-          : output.includes('NO_LEVEL_DAT')
-          ? 'level.dat not found — this may not be a valid .mcworld file'
-          : output.trim().slice(-400) || 'no output from container';
-        return NextResponse.json({ error: `World extraction failed: ${detail}` }, { status: 500 });
-      }
-
+      await putFiles(container, files, `/data/worlds/${levelName}`);
       return NextResponse.json({ success: true, destination: `/data/worlds/${levelName}` });
     }
 
-    // ── Resource / behavior pack extraction ──
-    const packDir =
-      type === 'behavior'
-        ? 'behavior_packs'
-        : 'resource_packs';
+    // ── Resource / behavior pack ──────────────────────────────────
+    const packDir = type === 'behavior' ? 'behavior_packs' : 'resource_packs';
 
-    const output = await execCommand(
-      container,
-      [
-        'bash', '-c',
-        `if [ ! -f "${tempPath}" ]; then echo "FILE_MISSING"; ls /tmp/ 2>&1; exit 1; fi; ` +
-        `rm -rf /tmp/mc_pack_extract; ` +
-        `mkdir -p /tmp/mc_pack_extract; ` +
-        // unzip exit code 1 = warning (still OK)
-        `unzip -o "${tempPath}" -d /tmp/mc_pack_extract/ 2>&1; ` +
-        `UNZIP_RC=$?; ` +
-        `if [ $UNZIP_RC -ge 2 ]; then echo "PACK_UNZIP_FAILED:$UNZIP_RC"; exit 1; fi; ` +
-        // Find manifest.json anywhere inside extracted tree (handles nested packs)
-        `MANIFEST=$(find /tmp/mc_pack_extract -name "manifest.json" 2>/dev/null | head -1); ` +
-        `if [ -n "$MANIFEST" ]; then ` +
-        `  UUID=$(python3 -c "import json; d=json.load(open('$MANIFEST')); print(d['header']['uuid'])" 2>/dev/null || date +%s); ` +
-        `else UUID=$(date +%s); fi; ` +
-        `mkdir -p "/data/${packDir}/$UUID"; ` +
-        `cp -rf /tmp/mc_pack_extract/. "/data/${packDir}/$UUID/"; ` +
-        `rm -rf /tmp/mc_pack_extract "${tempPath}"; ` +
-        `echo "__done__:$UUID"`,
-      ],
-      60_000,
-    );
+    // Find manifest.json to extract UUID (handles nested or flat zip)
+    const manifestPath = allPaths.find((p) => p === 'manifest.json' || p.endsWith('/manifest.json'));
 
-    if (!output.includes('__done__')) {
-      const detail = output.trim().slice(-300) || 'no output from container';
-      return NextResponse.json({ error: `Pack extraction failed: ${detail}` }, { status: 500 });
+    let uuid = `pack_${Date.now()}`;
+    if (manifestPath) {
+      try {
+        const manifest = JSON.parse(Buffer.from(unzipped[manifestPath]).toString('utf8')) as {
+          header?: { uuid?: string };
+        };
+        if (manifest.header?.uuid) uuid = manifest.header.uuid;
+      } catch {
+        // fall back to timestamp uuid
+      }
     }
 
-    const uuid = output.split('__done__:')[1]?.trim() ?? '';
+    // Strip leading folder if pack is nested inside a subfolder
+    const prefix = manifestPath
+      ? manifestPath.slice(0, manifestPath.length - 'manifest.json'.length)
+      : '';
+
+    const files: Record<string, Buffer> = {};
+    for (const [p, data] of Object.entries(unzipped)) {
+      if (prefix && !p.startsWith(prefix)) continue;
+      if (p.endsWith('/')) continue;
+      const rel = p.slice(prefix.length);
+      if (rel) files[rel] = Buffer.from(data);
+    }
+
+    await putFiles(container, files, `/data/${packDir}/${uuid}`);
     return NextResponse.json({ success: true, destination: `/data/${packDir}/${uuid}` });
+
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: msg }, { status: 500 });
