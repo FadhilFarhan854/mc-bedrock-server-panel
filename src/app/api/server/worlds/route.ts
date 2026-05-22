@@ -1,13 +1,10 @@
 import { NextResponse } from 'next/server';
 import { randomBytes } from 'crypto';
-import { Readable } from 'stream';
-import { pipeline } from 'stream/promises';
 import { pack as tarPack } from 'tar-stream';
 import { getContainer, execCommand } from '@/lib/docker';
 
 // Increase body size limit for file uploads (up to 512 MB)
 export const maxDuration = 120;
-
 // ── Allowed extensions ───────────────────────────────────────────
 const ALLOWED_EXTS = new Set(['mcworld', 'mcpack', 'mcaddon', 'mctemplate', 'zip']);
 
@@ -75,35 +72,34 @@ export async function POST(request: Request) {
       );
     }
 
-    // Validate body presence and size
-    if (!request.body) {
-      return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
-    }
-    const contentLength = parseInt(request.headers.get('content-length') ?? '0', 10);
-    if (contentLength === 0) {
+    // Validate body
+    const fileBuffer = Buffer.from(await request.arrayBuffer());
+    if (fileBuffer.byteLength === 0) {
       return NextResponse.json({ error: 'Empty file (0 bytes received)' }, { status: 400 });
     }
 
-    // ── Stream request body → tar entry → putArchive ────────────
-    // Avoids loading the entire file into RAM: data flows chunk-by-chunk.
-    // entry.size must match Content-Length so tar header is written correctly.
+    // ── Upload file into container /tmp via putArchive ───────────
+    // Key ordering: start putArchive FIRST (which begins consuming the pack
+    // stream), then write the file buffer into the tar entry.
+    // This prevents backpressure deadlock for large files: if we wrote the
+    // buffer before putArchive started reading, the stream's internal buffer
+    // would fill up and block the write indefinitely.
+    // Using fileBuffer.byteLength (not Content-Length) guarantees the tar
+    // entry size matches exactly — avoiding tar-stream's "Size mismatch" error.
     const container = getContainer();
     const pack = tarPack();
-    const tarEntry = pack.entry({ name: uploadName, size: contentLength });
+    const tarEntry = pack.entry({ name: uploadName, size: fileBuffer.byteLength });
 
-    // pipeline(body → tarEntry) is non-blocking here; putArchive drives consumption
-    const bodyReadable = Readable.fromWeb(
-      request.body as Parameters<typeof Readable.fromWeb>[0],
-    );
-    const pipePromise = pipeline(bodyReadable, tarEntry).then(() => pack.finalize());
-
-    await new Promise<void>((resolve, reject) => {
+    const putPromise = new Promise<void>((resolve, reject) => {
       container.putArchive(pack, { path: '/tmp' }, (err: unknown) => {
         if (err) reject(err instanceof Error ? err : new Error(String(err)));
         else resolve();
       });
     });
-    await pipePromise;
+
+    tarEntry.end(fileBuffer);  // non-blocking: putArchive is already consuming
+    pack.finalize();
+    await putPromise;
 
     try {
       if (type === 'world' || ext === 'mcworld' || ext === 'mctemplate') {
