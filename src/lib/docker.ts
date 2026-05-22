@@ -60,7 +60,12 @@ export class ContainerNotRunningError extends Error {
 
 /**
  * Run a command inside a container and return stdout as a string.
- * Uses Tty:true to avoid Docker's multiplexed 8-byte frame headers.
+ *
+ * Uses Tty:false + demuxStream so the stream properly ends when the process
+ * exits (Tty:true TTY streams can hang waiting for the socket to close).
+ * After the stream ends we inspect the exec to get the real exit code and
+ * throw if it is non-zero.
+ *
  * @param timeoutMs - safety timeout in ms (default 5 s; use larger value for long-running ops)
  */
 export async function execCommand(
@@ -74,7 +79,7 @@ export async function execCommand(
       Cmd: cmd,
       AttachStdout: true,
       AttachStderr: true,
-      Tty: true,
+      Tty: false,
     });
   } catch (err) {
     // Docker returns 409 when container is stopped/paused
@@ -87,22 +92,33 @@ export async function execCommand(
 
   const stream = await exec.start({ hijack: true, stdin: false });
 
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = [];
+  const output = await new Promise<string>((resolve, reject) => {
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
     let resolved = false;
 
     const finish = () => {
       if (!resolved) {
         resolved = true;
-        resolve(Buffer.concat(chunks).toString('utf8'));
+        resolve(
+          Buffer.concat([...stdout, ...stderr]).toString('utf8'),
+        );
       }
     };
 
-    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+    // Tty:false → Docker sends multiplexed frames; demuxStream separates them
+    docker.modem.demuxStream(
+      stream,
+      { write: (c: Buffer) => stdout.push(c) } as NodeJS.WritableStream,
+      { write: (c: Buffer) => stderr.push(c) } as NodeJS.WritableStream,
+    );
+
     stream.on('end', finish);
-    stream.on('error', finish);
+    stream.on('error', (e: Error) => (resolved ? undefined : reject(e)));
     setTimeout(finish, timeoutMs);
   });
+
+  return output;
 }
 
 /**

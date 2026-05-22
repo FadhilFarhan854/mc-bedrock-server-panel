@@ -7,7 +7,7 @@ const nextConfig: NextConfig = {
   serverExternalPackages: ['dockerode'],
   experimental: {
     serverActions: {
-      bodySizeLimit: '200mb',
+      bodySizeLimit: '512mb',
     },
   },
 };

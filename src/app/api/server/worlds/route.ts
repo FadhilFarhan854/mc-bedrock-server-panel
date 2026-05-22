@@ -1,9 +1,11 @@
 import { NextResponse } from 'next/server';
 import { randomBytes } from 'crypto';
+import { Readable } from 'stream';
+import { pipeline } from 'stream/promises';
 import { pack as tarPack } from 'tar-stream';
 import { getContainer, execCommand } from '@/lib/docker';
 
-// Increase body size limit for file uploads (up to 200 MB)
+// Increase body size limit for file uploads (up to 512 MB)
 export const maxDuration = 120;
 
 // ── Allowed extensions ───────────────────────────────────────────
@@ -73,27 +75,35 @@ export async function POST(request: Request) {
       );
     }
 
-    // Read raw binary body
-    const fileBuffer = Buffer.from(await request.arrayBuffer());
-    if (fileBuffer.byteLength === 0) {
+    // Validate body presence and size
+    if (!request.body) {
+      return NextResponse.json({ error: 'Empty request body' }, { status: 400 });
+    }
+    const contentLength = parseInt(request.headers.get('content-length') ?? '0', 10);
+    if (contentLength === 0) {
       return NextResponse.json({ error: 'Empty file (0 bytes received)' }, { status: 400 });
     }
 
-    // ── Upload raw file into container /tmp via putArchive ───────
-    // Use tar-stream (not a custom Buffer) so the binary content is
-    // streamed byte-for-byte without any UTF-8 / encoding mangling.
+    // ── Stream request body → tar entry → putArchive ────────────
+    // Avoids loading the entire file into RAM: data flows chunk-by-chunk.
+    // entry.size must match Content-Length so tar header is written correctly.
     const container = getContainer();
     const pack = tarPack();
-    await new Promise<void>((res, rej) =>
-      pack.entry({ name: uploadName }, fileBuffer, (e) => (e ? rej(e) : res())),
+    const tarEntry = pack.entry({ name: uploadName, size: contentLength });
+
+    // pipeline(body → tarEntry) is non-blocking here; putArchive drives consumption
+    const bodyReadable = Readable.fromWeb(
+      request.body as Parameters<typeof Readable.fromWeb>[0],
     );
-    pack.finalize();
+    const pipePromise = pipeline(bodyReadable, tarEntry).then(() => pack.finalize());
+
     await new Promise<void>((resolve, reject) => {
       container.putArchive(pack, { path: '/tmp' }, (err: unknown) => {
         if (err) reject(err instanceof Error ? err : new Error(String(err)));
         else resolve();
       });
     });
+    await pipePromise;
 
     try {
       if (type === 'world' || ext === 'mcworld' || ext === 'mctemplate') {
