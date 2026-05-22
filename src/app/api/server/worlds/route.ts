@@ -108,7 +108,7 @@ export async function POST(request: Request) {
           `mkdir -p '${destDir}' && ` +
           `cp -r "$WORLDDIR/." '${destDir}/'`;
 
-        await execCommand(container, ['bash', '-c', script]);
+        await execCommand(container, ['bash', '-c', script], 90_000);
         return NextResponse.json({ success: true, destination: destDir });
 
       } else {
@@ -128,7 +128,7 @@ export async function POST(request: Request) {
           `cp -r "$PACKDIR/." "/data/${packDir}/$UUID/" && ` +
           `echo "UUID:$UUID"`;
 
-        const output = await execCommand(container, ['bash', '-c', script]);
+        const output = await execCommand(container, ['bash', '-c', script], 90_000);
         const uuidMatch = /UUID:(.+)/.exec(output);
         const uuid = uuidMatch ? uuidMatch[1].trim() : `pack_${Date.now()}`;
         return NextResponse.json({ success: true, destination: `/data/${packDir}/${uuid}` });
