@@ -13,8 +13,7 @@
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "dockerode": "^4.0.4",
-    "lucide-react": "^0.511.0",
-    "jszip": "^3.10.1"
+    "lucide-react": "^0.511.0"
   },
   "devDependencies": {
     "@types/dockerode": "^3.3.38",
