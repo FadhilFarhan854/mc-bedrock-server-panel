@@ -48,9 +48,8 @@ export async function GET() {
 
 // ── POST — upload file (raw binary body, metadata via URL params) ──
 export async function POST(request: Request) {
-  const sessionId  = randomBytes(8).toString('hex');
-  const uploadName = `mc_upload_${sessionId}`;
-  const extractDir = `/tmp/mc_extract_${sessionId}`;
+  const sessionId = randomBytes(8).toString('hex');
+  const tmpName   = `upload_${sessionId}`;
 
   try {
     const url       = new URL(request.url);
@@ -72,92 +71,100 @@ export async function POST(request: Request) {
       );
     }
 
-    // Validate body
     const fileBuffer = Buffer.from(await request.arrayBuffer());
     if (fileBuffer.byteLength === 0) {
       return NextResponse.json({ error: 'Empty file (0 bytes received)' }, { status: 400 });
     }
 
-    // ── Upload file into container /tmp via putArchive ───────────
-    // Key ordering: start putArchive FIRST (which begins consuming the pack
-    // stream), then write the file buffer into the tar entry.
-    // This prevents backpressure deadlock for large files: if we wrote the
-    // buffer before putArchive started reading, the stream's internal buffer
-    // would fill up and block the write indefinitely.
-    // Using fileBuffer.byteLength (not Content-Length) guarantees the tar
-    // entry size matches exactly — avoiding tar-stream's "Size mismatch" error.
-    const container = getContainer();
-    const pack = tarPack();
-    const tarEntry = pack.entry({ name: uploadName, size: fileBuffer.byteLength });
+    const container  = getContainer();
+    const isWorld    = type === 'world' || ext === 'mcworld' || ext === 'mctemplate';
+    const levelName  = worldName
+      ? worldName.replace(/[^a-zA-Z0-9 _\-().]/g, '_')
+      : 'Uploaded World';
 
+    // Where to put the zip and unzip it:
+    //   worlds → directly into /data/worlds/<name>/
+    //   packs  → /tmp/<sessionId>/ first (need UUID from manifest before final move)
+    const uploadDir = isWorld
+      ? `/data/worlds/${levelName}`
+      : `/tmp/mc_pack_${sessionId}`;
+
+    // ── 1. Create the upload directory ─────────────────────────
+    await execCommand(container, ['bash', '-c', `mkdir -p '${uploadDir}'`], 10_000);
+
+    // ── 2. Upload zip into uploadDir via putArchive ─────────────
+    // Start putArchive FIRST so it drains the pack stream while we write,
+    // preventing backpressure deadlock for large files.
+    const pack     = tarPack();
+    const tarEntry = pack.entry({ name: tmpName, size: fileBuffer.byteLength });
     const putPromise = new Promise<void>((resolve, reject) => {
-      container.putArchive(pack, { path: '/tmp' }, (err: unknown) => {
+      container.putArchive(pack, { path: uploadDir }, (err: unknown) => {
         if (err) reject(err instanceof Error ? err : new Error(String(err)));
         else resolve();
       });
     });
-
-    tarEntry.end(fileBuffer);  // non-blocking: putArchive is already consuming
+    tarEntry.end(fileBuffer);
     pack.finalize();
     await putPromise;
 
-    try {
-      if (type === 'world' || ext === 'mcworld' || ext === 'mctemplate') {
-        // ── World: extract inside container, find level.dat, copy to destination ──
-        const levelName = worldName
-          ? worldName.replace(/[^a-zA-Z0-9 _\-().]/g, '_')
-          : 'Uploaded World';
-        const destDir = `/data/worlds/${levelName}`;
+    // ── 3. Unzip in place & clean up ───────────────────────────
+    let destDir: string;
 
-        const script =
-          `mkdir -p '${extractDir}' && ` +
-          `unzip -o '/tmp/${uploadName}' -d '${extractDir}'; RC=$?; ` +
-          `[ "$RC" -gt 1 ] && echo "unzip failed (exit $RC)" && exit 1; ` +
-          `LEVELDAT=$(find '${extractDir}' -name 'level.dat' -maxdepth 3 | head -1); ` +
-          `[ -z "$LEVELDAT" ] && echo "level.dat not found in archive" && exit 1; ` +
-          `WORLDDIR=$(dirname "$LEVELDAT"); ` +
-          `mkdir -p '${destDir}' && ` +
-          `cp -r "$WORLDDIR/." '${destDir}/' && ` +
-          `echo "__DONE__"`;
+    if (isWorld) {
+      const script =
+        // Verify the uploaded file arrived intact
+        `ACTUAL=$(stat -c%s '${uploadDir}/${tmpName}'); ` +
+        `[ "$ACTUAL" != "${fileBuffer.byteLength}" ] && ` +
+        `  echo "Upload corrupted: got $ACTUAL bytes, expected ${fileBuffer.byteLength}" && exit 1; ` +
+        // Unzip directly into the world directory
+        `unzip -o '${uploadDir}/${tmpName}' -d '${uploadDir}'; RC=$?; ` +
+        `rm -f '${uploadDir}/${tmpName}'; ` +
+        `[ "$RC" -gt 1 ] && echo "unzip failed (exit $RC)" && exit 1; ` +
+        // If the zip had a top-level folder, flatten it
+        `LEVELDAT=$(find '${uploadDir}' -name 'level.dat' -maxdepth 3 | head -1); ` +
+        `[ -z "$LEVELDAT" ] && echo "level.dat not found in archive" && exit 1; ` +
+        `LEVELDIR=$(dirname "$LEVELDAT"); ` +
+        `if [ "$LEVELDIR" != '${uploadDir}' ]; then ` +
+        `  cp -r "$LEVELDIR/." '${uploadDir}/' && rm -rf "$LEVELDIR"; ` +
+        `fi; ` +
+        `echo "__DONE__"`;
 
-        const worldOut = await execCommand(container, ['bash', '-c', script], 90_000);
-        if (!worldOut.includes('__DONE__')) {
-          throw new Error(worldOut.trim() || 'Extraction failed inside container');
-        }
-        return NextResponse.json({ success: true, destination: destDir });
-
-      } else {
-        // ── Pack: extract inside container, read UUID from manifest.json via jq ──
-        const packDir = type === 'behavior' ? 'behavior_packs' : 'resource_packs';
-
-        const script =
-          `mkdir -p '${extractDir}' && ` +
-          `unzip -o '/tmp/${uploadName}' -d '${extractDir}'; RC=$?; ` +
-          `[ "$RC" -gt 1 ] && echo "unzip failed (exit $RC)" && exit 1; ` +
-          `MANIFEST=$(find '${extractDir}' -name 'manifest.json' -maxdepth 3 | head -1); ` +
-          `[ -z "$MANIFEST" ] && echo "manifest.json not found" && exit 1; ` +
-          `UUID=$(jq -r '.header.uuid // empty' "$MANIFEST" 2>/dev/null); ` +
-          `[ -z "$UUID" ] && UUID="pack_$(date +%s)"; ` +
-          `PACKDIR=$(dirname "$MANIFEST"); ` +
-          `mkdir -p "/data/${packDir}/$UUID" && ` +
-          `cp -r "$PACKDIR/." "/data/${packDir}/$UUID/" && ` +
-          `echo "UUID:$UUID" && echo "__DONE__"`;
-
-        const packOut = await execCommand(container, ['bash', '-c', script], 90_000);
-        if (!packOut.includes('__DONE__')) {
-          throw new Error(packOut.trim() || 'Pack extraction failed inside container');
-        }
-        const uuidMatch = /UUID:(.+)/.exec(packOut);
-        const uuid = uuidMatch ? uuidMatch[1].trim() : `pack_${Date.now()}`;
-        return NextResponse.json({ success: true, destination: `/data/${packDir}/${uuid}` });
+      const out = await execCommand(container, ['bash', '-c', script], 90_000);
+      if (!out.includes('__DONE__')) {
+        throw new Error(out.trim() || 'World extraction failed inside container');
       }
-    } finally {
-      // Cleanup temp files inside the container
-      await execCommand(container, [
-        'bash', '-c',
-        `rm -rf '/tmp/${uploadName}' '${extractDir}' 2>/dev/null || true`,
-      ]).catch(() => null);
+      destDir = uploadDir;
+
+    } else {
+      const packDir = type === 'behavior' ? 'behavior_packs' : 'resource_packs';
+      const script =
+        `ACTUAL=$(stat -c%s '${uploadDir}/${tmpName}'); ` +
+        `[ "$ACTUAL" != "${fileBuffer.byteLength}" ] && ` +
+        `  echo "Upload corrupted: got $ACTUAL bytes, expected ${fileBuffer.byteLength}" && exit 1; ` +
+        `unzip -o '${uploadDir}/${tmpName}' -d '${uploadDir}'; RC=$?; ` +
+        `rm -f '${uploadDir}/${tmpName}'; ` +
+        `[ "$RC" -gt 1 ] && echo "unzip failed (exit $RC)" && exit 1; ` +
+        `MANIFEST=$(find '${uploadDir}' -name 'manifest.json' -maxdepth 3 | head -1); ` +
+        `[ -z "$MANIFEST" ] && echo "manifest.json not found" && exit 1; ` +
+        `UUID=$(jq -r '.header.uuid // empty' "$MANIFEST" 2>/dev/null); ` +
+        `[ -z "$UUID" ] && UUID="pack_$(date +%s)"; ` +
+        `MANIFESTDIR=$(dirname "$MANIFEST"); ` +
+        `FINAL="/data/${packDir}/$UUID"; ` +
+        `mkdir -p "$FINAL" && cp -r "$MANIFESTDIR/." "$FINAL/" && rm -rf '${uploadDir}'; ` +
+        `echo "UUID:$UUID" && echo "__DONE__"`;
+
+      const out = await execCommand(container, ['bash', '-c', script], 90_000);
+      if (!out.includes('__DONE__')) {
+        // Clean up temp dir on failure
+        await execCommand(container, ['bash', '-c', `rm -rf '${uploadDir}' 2>/dev/null || true`]).catch(() => null);
+        throw new Error(out.trim() || 'Pack extraction failed inside container');
+      }
+      const uuidMatch = /UUID:(.+)/.exec(out);
+      const uuid = uuidMatch ? uuidMatch[1].trim() : `pack_${Date.now()}`;
+      destDir = `/data/${packDir}/${uuid}`;
     }
+
+    return NextResponse.json({ success: true, destination: destDir });
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
