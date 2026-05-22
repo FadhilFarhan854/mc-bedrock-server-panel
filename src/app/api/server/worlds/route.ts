@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 import { getContainer, execCommand } from '@/lib/docker';
 
 // Increase body size limit for file uploads (up to 512 MB)
@@ -70,13 +70,37 @@ export async function POST(request: Request) {
       );
     }
 
-    const fileBuffer = Buffer.from(await request.arrayBuffer());
+    // ── Body reading ────────────────────────────────────────────
+    // Use getReader() streaming instead of request.arrayBuffer() to avoid
+    // Next.js's internal body-size limit (which can silently truncate large
+    // binary uploads and produce "End-of-central-directory not found" errors).
+    const declaredSize = parseInt(request.headers.get('content-length') ?? '0', 10);
+    const chunks: Buffer[] = [];
+    const reader = request.body!.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const fileBuffer = Buffer.concat(chunks);
+
     if (fileBuffer.byteLength === 0) {
       return NextResponse.json({ error: 'Empty file (0 bytes received)' }, { status: 400 });
     }
 
-    // Validate ZIP magic bytes (PK\x03\x04 = 0x504b0304) before doing anything else.
-    // If this fails, the corruption happened before we even touch the container.
+    // Detect silent body truncation before doing any Docker work
+    if (declaredSize > 0 && fileBuffer.byteLength !== declaredSize) {
+      return NextResponse.json(
+        { error: `Upload body truncated: server received ${fileBuffer.byteLength} bytes but file is ${declaredSize} bytes. Check Next.js/nginx body-size limits.` },
+        { status: 400 },
+      );
+    }
+
+    // Validate ZIP magic bytes (PK\x03\x04) before doing anything else.
     const magic = fileBuffer.subarray(0, 4).toString('hex');
     if (magic !== '504b0304') {
       return NextResponse.json(
@@ -84,6 +108,9 @@ export async function POST(request: Request) {
         { status: 400 },
       );
     }
+
+    // SHA-256 of the received buffer — verified in-container after writing
+    const sha256 = createHash('sha256').update(fileBuffer).digest('hex');
 
     const container  = getContainer();
     const isWorld    = type === 'world' || ext === 'mcworld' || ext === 'mctemplate';
@@ -101,25 +128,26 @@ export async function POST(request: Request) {
     // ── 1. Create the upload directory ─────────────────────────
     await execCommand(container, ['bash', '-c', `mkdir -p '${uploadDir}'`], 10_000);
 
-    // ── 2. Write file directly into container via exec stdin ────
-    // putArchive wraps the payload in a tar archive, which can introduce
-    // binary corruption on certain byte patterns. Writing via exec stdin
-    // (`cat > file`) sends raw bytes over the hijacked Docker socket with
-    // zero encoding: whatever we write is exactly what lands on disk.
+    // ── 2. Write file into container via exec stdin (base64 encoded) ──
+    // Encoding the payload as base64 before transmission makes the transfer
+    // immune to any byte-level encoding transformations (CR/LF conversion,
+    // null-byte stripping, etc.) that may occur over the Docker exec socket.
+    // `base64 -d` inside the container decodes back to the original bytes.
+    // Only [A-Za-z0-9+/=] characters are sent — no binary values that could
+    // be mangled in transit.
+    const b64Buffer = Buffer.from(fileBuffer.toString('base64'));
+
     const writeExec = await container.exec({
-      Cmd:           ['bash', '-c', `cat > '${uploadDir}/${tmpName}'`],
+      Cmd:           ['bash', '-c', `base64 -d > '${uploadDir}/${tmpName}'`],
       AttachStdin:   true,
       AttachStdout:  true,
       AttachStderr:  true,
       Tty:           false,
     });
     const writeStream = await writeExec.start({ hijack: true, stdin: true });
+    writeStream.resume(); // drain any framing bytes Docker sends back
 
-    // Drain demuxed stdout/stderr frames from the container process
-    // (cat produces no output; flowing mode discards whatever Docker sends)
-    writeStream.resume();
-
-    // Pump fileBuffer → stdin in 64 KB chunks, respecting backpressure
+    // Pump b64Buffer → stdin in 64 KB chunks, respecting backpressure
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(
         () => reject(new Error('File write to container timed out')),
@@ -133,15 +161,15 @@ export async function POST(request: Request) {
       const CHUNK = 64 * 1024;
       let offset = 0;
       const pump = () => {
-        while (offset < fileBuffer.length) {
-          const slice = fileBuffer.subarray(offset, offset + CHUNK);
+        while (offset < b64Buffer.length) {
+          const slice = b64Buffer.subarray(offset, offset + CHUNK);
           offset += slice.length;
-          if (!writeStream.write(slice) && offset < fileBuffer.length) {
+          if (!writeStream.write(slice) && offset < b64Buffer.length) {
             writeStream.once('drain', pump);
             return;
           }
         }
-        writeStream.end(); // EOF → cat exits → Docker closes socket → 'end'
+        writeStream.end(); // EOF → base64 -d exits → Docker closes socket → 'end'
       };
       pump();
     });
@@ -151,14 +179,14 @@ export async function POST(request: Request) {
 
     if (isWorld) {
       const script =
-        // Verify the uploaded file arrived intact
-        `ACTUAL=$(stat -c%s '${uploadDir}/${tmpName}'); ` +
-        `[ "$ACTUAL" != "${fileBuffer.byteLength}" ] && ` +
-        `  echo "Upload corrupted: got $ACTUAL bytes, expected ${fileBuffer.byteLength}" && exit 1; ` +
+        // SHA-256 integrity check: confirms base64 decode produced the exact original bytes
+        `ACTUAL_SHA=$(sha256sum '${uploadDir}/${tmpName}' | awk '{print $1}'); ` +
+        `[ "$ACTUAL_SHA" != "${sha256}" ] && ` +
+        `  echo "Integrity check failed — SHA256 mismatch (got $ACTUAL_SHA, expected ${sha256})" && exit 1; ` +
         // Unzip directly into the world directory
-        `unzip -o '${uploadDir}/${tmpName}' -d '${uploadDir}'; RC=$?; ` +
+        `UNZIP_OUT=$(unzip -o '${uploadDir}/${tmpName}' -d '${uploadDir}' 2>&1); RC=$?; ` +
         `rm -f '${uploadDir}/${tmpName}'; ` +
-        `[ "$RC" -gt 1 ] && echo "unzip failed (exit $RC)" && exit 1; ` +
+        `[ "$RC" -gt 1 ] && echo "unzip failed (exit $RC): $UNZIP_OUT" && exit 1; ` +
         // If the zip had a top-level folder, flatten it
         `LEVELDAT=$(find '${uploadDir}' -name 'level.dat' -maxdepth 3 | head -1); ` +
         `[ -z "$LEVELDAT" ] && echo "level.dat not found in archive" && exit 1; ` +
@@ -194,12 +222,12 @@ export async function POST(request: Request) {
     } else {
       const packDir = type === 'behavior' ? 'behavior_packs' : 'resource_packs';
       const script =
-        `ACTUAL=$(stat -c%s '${uploadDir}/${tmpName}'); ` +
-        `[ "$ACTUAL" != "${fileBuffer.byteLength}" ] && ` +
-        `  echo "Upload corrupted: got $ACTUAL bytes, expected ${fileBuffer.byteLength}" && exit 1; ` +
-        `unzip -o '${uploadDir}/${tmpName}' -d '${uploadDir}'; RC=$?; ` +
+        `ACTUAL_SHA=$(sha256sum '${uploadDir}/${tmpName}' | awk '{print $1}'); ` +
+        `[ "$ACTUAL_SHA" != "${sha256}" ] && ` +
+        `  echo "Integrity check failed — SHA256 mismatch (got $ACTUAL_SHA, expected ${sha256})" && exit 1; ` +
+        `UNZIP_OUT=$(unzip -o '${uploadDir}/${tmpName}' -d '${uploadDir}' 2>&1); RC=$?; ` +
         `rm -f '${uploadDir}/${tmpName}'; ` +
-        `[ "$RC" -gt 1 ] && echo "unzip failed (exit $RC)" && exit 1; ` +
+        `[ "$RC" -gt 1 ] && echo "unzip failed (exit $RC): $UNZIP_OUT" && exit 1; ` +
         `MANIFEST=$(find '${uploadDir}' -name 'manifest.json' -maxdepth 3 | head -1); ` +
         `[ -z "$MANIFEST" ] && echo "manifest.json not found" && exit 1; ` +
         `UUID=$(jq -r '.header.uuid // empty' "$MANIFEST" 2>/dev/null); ` +
