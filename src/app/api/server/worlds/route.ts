@@ -100,17 +100,18 @@ export async function POST(request: Request) {
         container,
         [
           'bash', '-c',
-          // 1. Clean up any stale temp dir from a previous failed run
+          // 1. Clean up any stale temp dir
           `rm -rf /tmp/mc_world_extract; ` +
           `mkdir -p /tmp/mc_world_extract; ` +
-          // 2. Extract the .mcworld (it's just a zip)
-          `unzip -o "${tempPath}" -d /tmp/mc_world_extract/; ` +
-          `if [ $? -ne 0 ]; then echo "UNZIP_FAILED"; exit 1; fi; ` +
-          // 3. Detect structure: flat (level.dat at root) vs nested (level.dat inside a subfolder)
-          `SRCDIR=/tmp/mc_world_extract; ` +
-          `SUBDIR=$(find /tmp/mc_world_extract -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1); ` +
-          `if [ -n "$SUBDIR" ] && [ -f "$SUBDIR/level.dat" ]; then SRCDIR=$SUBDIR; fi; ` +
-          // 4. Copy world files (use /. to include hidden files)
+          // 2. Extract — unzip exit code 1 = warning (still OK), >=2 = real error
+          `unzip -o "${tempPath}" -d /tmp/mc_world_extract/ 2>&1; ` +
+          `UNZIP_RC=$?; ` +
+          `if [ $UNZIP_RC -ge 2 ]; then echo "UNZIP_FAILED:$UNZIP_RC"; exit 1; fi; ` +
+          // 3. Find level.dat anywhere inside the extracted tree
+          `LEVEL_DAT=$(find /tmp/mc_world_extract -name "level.dat" 2>/dev/null | head -1); ` +
+          `if [ -z "$LEVEL_DAT" ]; then echo "NO_LEVEL_DAT"; exit 1; fi; ` +
+          `SRCDIR=$(dirname "$LEVEL_DAT"); ` +
+          // 4. Copy world files to destination
           `mkdir -p "/data/worlds/${levelName}"; ` +
           `cp -rf "$SRCDIR/." "/data/worlds/${levelName}/"; ` +
           `rm -rf /tmp/mc_world_extract "${tempPath}"; ` +
@@ -121,9 +122,11 @@ export async function POST(request: Request) {
 
       if (!output.includes('__done__')) {
         const detail = output.includes('UNZIP_FAILED')
-          ? 'unzip failed — file may be corrupted or not a valid .mcworld'
-          : output.trim() || 'no output from container';
-        return NextResponse.json({ error: 'World extraction failed', detail }, { status: 500 });
+          ? `unzip error (${output.match(/UNZIP_FAILED:(\d+)/)?.[1] ?? '?'}) — file may be corrupted`
+          : output.includes('NO_LEVEL_DAT')
+          ? 'level.dat not found — this may not be a valid .mcworld file'
+          : output.trim().slice(-300) || 'no output from container';
+        return NextResponse.json({ error: `World extraction failed: ${detail}` }, { status: 500 });
       }
 
       return NextResponse.json({ success: true, destination: `/data/worlds/${levelName}` });
@@ -139,21 +142,28 @@ export async function POST(request: Request) {
       container,
       [
         'bash', '-c',
-        `set -e && ` +
-        `mkdir -p /tmp/mc_pack_extract && ` +
-        `unzip -o "${tempPath}" -d /tmp/mc_pack_extract/ && ` +
-        // Try to read UUID from manifest.json; fall back to timestamp
-        `UUID=$(python3 -c "import json,sys; d=json.load(open('/tmp/mc_pack_extract/manifest.json')); print(d['header']['uuid'])" 2>/dev/null || date +%s) && ` +
-        `mkdir -p "/data/${packDir}/$UUID" && ` +
-        `cp -rf /tmp/mc_pack_extract/* "/data/${packDir}/$UUID/" && ` +
-        `rm -rf /tmp/mc_pack_extract "${tempPath}" && ` +
+        `rm -rf /tmp/mc_pack_extract; ` +
+        `mkdir -p /tmp/mc_pack_extract; ` +
+        // unzip exit code 1 = warning (still OK)
+        `unzip -o "${tempPath}" -d /tmp/mc_pack_extract/ 2>&1; ` +
+        `UNZIP_RC=$?; ` +
+        `if [ $UNZIP_RC -ge 2 ]; then echo "PACK_UNZIP_FAILED:$UNZIP_RC"; exit 1; fi; ` +
+        // Find manifest.json anywhere inside extracted tree (handles nested packs)
+        `MANIFEST=$(find /tmp/mc_pack_extract -name "manifest.json" 2>/dev/null | head -1); ` +
+        `if [ -n "$MANIFEST" ]; then ` +
+        `  UUID=$(python3 -c "import json; d=json.load(open('$MANIFEST')); print(d['header']['uuid'])" 2>/dev/null || date +%s); ` +
+        `else UUID=$(date +%s); fi; ` +
+        `mkdir -p "/data/${packDir}/$UUID"; ` +
+        `cp -rf /tmp/mc_pack_extract/. "/data/${packDir}/$UUID/"; ` +
+        `rm -rf /tmp/mc_pack_extract "${tempPath}"; ` +
         `echo "__done__:$UUID"`,
       ],
       60_000,
     );
 
     if (!output.includes('__done__')) {
-      return NextResponse.json({ error: 'Pack extraction failed', detail: output }, { status: 500 });
+      const detail = output.trim().slice(-300) || 'no output from container';
+      return NextResponse.json({ error: `Pack extraction failed: ${detail}` }, { status: 500 });
     }
 
     const uuid = output.split('__done__:')[1]?.trim() ?? '';
