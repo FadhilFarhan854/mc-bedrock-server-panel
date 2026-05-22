@@ -1,4 +1,5 @@
 import Docker from 'dockerode';
+import { PassThrough } from 'stream';
 
 // ── Docker client factory ────────────────────────────────────────
 function createDockerClient(): Docker {
@@ -93,25 +94,22 @@ export async function execCommand(
   const stream = await exec.start({ hijack: true, stdin: false });
 
   const output = await new Promise<string>((resolve, reject) => {
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
+    const stdoutPass = new PassThrough();
+    const stderrPass = new PassThrough();
+    const chunks: Buffer[] = [];
     let resolved = false;
+
+    stdoutPass.on('data', (c: Buffer) => chunks.push(c));
+    stderrPass.on('data', (c: Buffer) => chunks.push(c));
 
     const finish = () => {
       if (!resolved) {
         resolved = true;
-        resolve(
-          Buffer.concat([...stdout, ...stderr]).toString('utf8'),
-        );
+        resolve(Buffer.concat(chunks).toString('utf8'));
       }
     };
 
-    // Tty:false → Docker sends multiplexed frames; demuxStream separates them
-    docker.modem.demuxStream(
-      stream,
-      { write: (c: Buffer) => stdout.push(c) } as NodeJS.WritableStream,
-      { write: (c: Buffer) => stderr.push(c) } as NodeJS.WritableStream,
-    );
+    docker.modem.demuxStream(stream, stdoutPass, stderrPass);
 
     stream.on('end', finish);
     stream.on('error', (e: Error) => (resolved ? undefined : reject(e)));
