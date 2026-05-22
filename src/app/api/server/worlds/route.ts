@@ -106,9 +106,13 @@ export async function POST(request: Request) {
           `[ -z "$LEVELDAT" ] && echo "level.dat not found in archive" && exit 1; ` +
           `WORLDDIR=$(dirname "$LEVELDAT"); ` +
           `mkdir -p '${destDir}' && ` +
-          `cp -r "$WORLDDIR/." '${destDir}/'`;
+          `cp -r "$WORLDDIR/." '${destDir}/' && ` +
+          `echo "__DONE__"`;
 
-        await execCommand(container, ['bash', '-c', script], 90_000);
+        const worldOut = await execCommand(container, ['bash', '-c', script], 90_000);
+        if (!worldOut.includes('__DONE__')) {
+          throw new Error(worldOut.trim() || 'Extraction failed inside container');
+        }
         return NextResponse.json({ success: true, destination: destDir });
 
       } else {
@@ -126,10 +130,13 @@ export async function POST(request: Request) {
           `PACKDIR=$(dirname "$MANIFEST"); ` +
           `mkdir -p "/data/${packDir}/$UUID" && ` +
           `cp -r "$PACKDIR/." "/data/${packDir}/$UUID/" && ` +
-          `echo "UUID:$UUID"`;
+          `echo "UUID:$UUID" && echo "__DONE__"`;
 
-        const output = await execCommand(container, ['bash', '-c', script], 90_000);
-        const uuidMatch = /UUID:(.+)/.exec(output);
+        const packOut = await execCommand(container, ['bash', '-c', script], 90_000);
+        if (!packOut.includes('__DONE__')) {
+          throw new Error(packOut.trim() || 'Pack extraction failed inside container');
+        }
+        const uuidMatch = /UUID:(.+)/.exec(packOut);
         const uuid = uuidMatch ? uuidMatch[1].trim() : `pack_${Date.now()}`;
         return NextResponse.json({ success: true, destination: `/data/${packDir}/${uuid}` });
       }
