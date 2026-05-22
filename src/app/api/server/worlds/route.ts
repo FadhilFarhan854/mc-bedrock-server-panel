@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { randomBytes } from 'crypto';
+import { pack as tarPack } from 'tar-stream';
 import { getContainer, execCommand } from '@/lib/docker';
-import { createTarBuffer } from '@/lib/tar';
 
 // Increase body size limit for file uploads (up to 200 MB)
 export const maxDuration = 120;
@@ -80,11 +80,16 @@ export async function POST(request: Request) {
     }
 
     // ── Upload raw file into container /tmp via putArchive ───────
-    // The BDS container has unzip + jq — extract entirely inside the container
+    // Use tar-stream (not a custom Buffer) so the binary content is
+    // streamed byte-for-byte without any UTF-8 / encoding mangling.
     const container = getContainer();
-    const uploadTar = createTarBuffer(uploadName, fileBuffer);
+    const pack = tarPack();
+    await new Promise<void>((res, rej) =>
+      pack.entry({ name: uploadName }, fileBuffer, (e) => (e ? rej(e) : res())),
+    );
+    pack.finalize();
     await new Promise<void>((resolve, reject) => {
-      container.putArchive(uploadTar, { path: '/tmp' }, (err: unknown) => {
+      container.putArchive(pack, { path: '/tmp' }, (err: unknown) => {
         if (err) reject(err instanceof Error ? err : new Error(String(err)));
         else resolve();
       });
