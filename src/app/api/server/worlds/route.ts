@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
+import { cookies } from 'next/headers';
 import { randomBytes, createHash } from 'crypto';
 import { getContainer, execCommand } from '@/lib/docker';
+import { COOKIE_NAME, validateToken } from '@/lib/auth';
 
 // Increase body size limit for file uploads (up to 512 MB)
 export const maxDuration = 120;
@@ -47,6 +49,13 @@ export async function GET() {
 
 // ── POST — upload file (raw binary body, metadata via URL params) ──
 export async function POST(request: Request) {
+  // Auth — middleware is excluded for this route (Edge body-size limit workaround)
+  const cookieStore = await cookies();
+  const token = cookieStore.get(COOKIE_NAME)?.value ?? '';
+  if (!(await validateToken(token))) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+
   const sessionId = randomBytes(8).toString('hex');
   const tmpName   = `upload_${sessionId}`;
 

@@ -20,5 +20,8 @@ export async function middleware(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+  // Exclude large-body upload routes from Edge middleware to avoid the
+  // ~10 MB body buffer limit imposed by the Edge Runtime.  Auth for those
+  // routes is enforced directly in the route handler instead.
+  matcher: ['/((?!_next/static|_next/image|favicon.ico|api/server/worlds).*)'],
 };
